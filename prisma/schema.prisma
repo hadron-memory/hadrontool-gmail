@@ -1,0 +1,115 @@
+// hadrontool-gmail — the tool's OWN small database.
+//
+// Boundary (hadron-server#396 / #580): this tool owns everything
+// provider-specific — encrypted Google refresh tokens, Gmail watch state and
+// the per-connection history cursor, notification dedupe, idempotency
+// records. hadron-server keeps only the connection identity record and runs
+// authorization BEFORE it ever calls this service; there are zero Gmail
+// columns in core.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ConnectionStatus {
+  ACTIVE
+  ERROR
+}
+
+/// One connected Gmail mailbox. The `id` is returned to hadron-server at
+/// creation time and is the `connectionId` every operation call carries.
+model Connection {
+  id              String           @id @default(cuid())
+  provider        String           @default("gmail")
+  mailboxEmail    String           @map("mailbox_email")
+  displayName     String?          @map("display_name")
+  /// AES-256-GCM-encrypted Google refresh token (iv‖tag‖ciphertext, base64),
+  /// under this tool's own TOKEN_ENCRYPTION_KEY — never core's key.
+  refreshTokenEnc String           @map("refresh_token_enc")
+  status          ConnectionStatus @default(ACTIVE)
+  /// Error message from the last permanent provider-auth failure.
+  lastError       String?          @map("last_error")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  deletedAt       DateTime?        @map("deleted_at")
+
+  watch             Watch?
+  subscribedFolders SubscribedFolder[]
+
+  @@index([mailboxEmail])
+  @@map("connections")
+}
+
+/// The mailbox-level Gmail watch (users.watch → Cloud Pub/Sub). Unlike
+/// Graph's per-folder subscriptions, Gmail has AT MOST ONE watch per mailbox;
+/// which events get forwarded is decided by SubscribedFolder rows. The watch
+/// expires after ~7 days; the renewal worker re-watches before expiry.
+model Watch {
+  id           String   @id @default(cuid())
+  connectionId String   @unique @map("connection_id")
+  expiresAt    DateTime @map("expires_at")
+  /// Last fully-processed Gmail historyId (uint64, stored as string). The
+  /// PRIMARY at-least-once mechanism: Pub/Sub notifications only carry
+  /// {emailAddress, historyId}; processing lists history deltas from this
+  /// cursor and advances it only after every message in the delta succeeded.
+  lastHistoryId String? @map("last_history_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@map("watches")
+}
+
+/// Which neutral folders (`inbox`, `sentitems`) core subscribed for events.
+/// Gmail's watch covers the whole mailbox; these rows gate which normalized
+/// events are actually forwarded to core.
+model SubscribedFolder {
+  id           String   @id @default(cuid())
+  connectionId String   @map("connection_id")
+  /// Neutral folder name, lowercase — `inbox` or `sentitems`.
+  folder       String
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, folder])
+  @@map("subscribed_folders")
+}
+
+/// Dedupe ledger for inbound messages — history deltas can overlap across
+/// notifications, so each (connection, message) pair is forwarded once.
+/// Rows are prunable after a retention window.
+model ProcessedNotification {
+  /// `<connectionId>:<gmailMessageId>`
+  id          String   @id
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@index([processedAt])
+  @@map("processed_notifications")
+}
+
+/// Idempotency records for mutating operations (at-least-once callers).
+/// Created as an in-flight RESERVATION before the provider mutation runs
+/// (responseJson null), completed with the response after — so concurrent
+/// duplicates cannot both execute. A replayed completed key returns the
+/// stored response without touching the provider.
+model IdempotencyRecord {
+  key          String   @id
+  operation    String
+  /// SHA-256 of the operation input — a key replayed with a DIFFERENT
+  /// payload is rejected instead of leaking the stored response.
+  requestHash  String   @map("request_hash")
+  /// JSON-serialized operation response; null while the original request is
+  /// still in flight.
+  responseJson String?  @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("idempotency_records")
+}
