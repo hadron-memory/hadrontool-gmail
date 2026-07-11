@@ -8,6 +8,7 @@
  * (Google normally doesn't rotate, but the plumbing is the platform-wide
  * invariant — see findings:oauth-rotation-persist-on-failure).
  */
+import { retryAfterSeconds } from '../../errors.js';
 import { refreshAccessToken, exchangeGoogleCode, fetchGoogleProfile } from './auth.js';
 import { FOLDER_TO_LABEL, STARRED_LABEL, UNREAD_LABEL, labelForFolder } from './labels.js';
 import {
@@ -30,6 +31,13 @@ import type {
 
 const BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const REQUEST_TIMEOUT_MS = 30000;
+/** Inline 429 retry budget: beyond this the typed provider_rate_limited
+ *  propagates — the caller (hadron-server) times out around 30s, so sleeping
+ *  longer here would answer nobody and can double mutations. */
+const MAX_INLINE_RETRY_AFTER_S = 10;
+/** Concurrency cap for fan-out reads (message hydration, label counts) —
+ *  Gmail's per-user quota is ~250 units/s and messages.get costs 5. */
+const FANOUT_CONCURRENCY = 8;
 
 /** Shape of a failed Google API call — what mapGmailError consumes. */
 interface ApiError extends Error {
@@ -38,16 +46,33 @@ interface ApiError extends Error {
   headers: Headers;
 }
 
+/** Map items through fn with bounded concurrency, preserving order. */
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /**
  * Fetch a Google API endpoint with a bearer token. The timeout signal covers
- * the response BODY read, not just the headers. Failures throw an ApiError
- * carrying status + Google's error reason for the typed mapper.
+ * the response BODY read, not just the headers. A 429 with a small
+ * Retry-After is retried ONCE at this per-request level (never re-running a
+ * whole multi-call operation). Failures throw an ApiError carrying status +
+ * Google's error reason for the typed mapper.
  */
 async function apiFetch<T>(
   accessToken: string,
   method: string,
   path: string,
   options: { query?: Record<string, string | string[] | number | undefined>; body?: unknown } = {},
+  attempt = 0,
 ): Promise<T> {
   const url = new URL(`${BASE}${path}`);
   for (const [key, value] of Object.entries(options.query ?? {})) {
@@ -67,6 +92,13 @@ async function apiFetch<T>(
   });
   const text = await res.text(); // still under the same timeout signal
   if (!res.ok) {
+    if (res.status === 429 && attempt === 0) {
+      const wait = retryAfterSeconds(res.headers, 5);
+      if (wait <= MAX_INLINE_RETRY_AFTER_S) {
+        await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+        return apiFetch(accessToken, method, path, options, attempt + 1);
+      }
+    }
     let reason: string | undefined;
     let message = `Gmail API ${method} ${path} failed with ${res.status}`;
     try {
@@ -85,34 +117,41 @@ async function apiFetch<T>(
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+/** Cached access tokens keyed by refresh token — Google access tokens live
+ *  ~1h; refreshing per provider call would cost one token-endpoint POST per
+ *  message in a history delta. Entries expire with a safety margin. */
+const accessTokenCache = new Map<string, { accessToken: string; expiresAt: number }>();
+const TOKEN_EXPIRY_MARGIN_S = 120;
+const TOKEN_CACHE_MAX = 1000;
+
 /**
- * Execute a Gmail call using a refresh token: acquire an access token, run
- * the call, retry once on 429 honoring Retry-After, and report refresh-token
- * rotation. Everything else propagates for mapGmailError at the ops layer.
+ * Execute a Gmail call using a refresh token: acquire an access token
+ * (cached across calls until near expiry) and report refresh-token rotation.
+ * Failures propagate for mapGmailError at the ops layer; per-request 429
+ * handling lives in apiFetch.
  */
 async function withToken<T>(
   refreshToken: string,
   fn: (accessToken: string) => Promise<T>,
 ): Promise<GmailCallResult<T>> {
+  const cached = accessTokenCache.get(refreshToken);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { data: await fn(cached.accessToken) };
+  }
+
   const tokenRes = await refreshAccessToken(refreshToken);
   const accessToken = tokenRes.access_token;
   const newRefreshToken =
     tokenRes.refresh_token && tokenRes.refresh_token !== refreshToken ? tokenRes.refresh_token : undefined;
+  if (accessTokenCache.size >= TOKEN_CACHE_MAX) accessTokenCache.clear();
+  accessTokenCache.set(newRefreshToken ?? refreshToken, {
+    accessToken,
+    expiresAt: Date.now() + Math.max(0, (tokenRes.expires_in ?? 0) - TOKEN_EXPIRY_MARGIN_S) * 1000,
+  });
+
   try {
-    try {
-      const data = await fn(accessToken);
-      return { data, newRefreshToken };
-    } catch (err) {
-      const statusCode = (err as { statusCode?: number })?.statusCode;
-      if (statusCode === 429) {
-        const rawRetry = (err as { headers?: { get?: (h: string) => string | null } })?.headers?.get?.('Retry-After');
-        const retryAfter = parseInt(rawRetry ?? '5', 10);
-        await new Promise((resolve) => setTimeout(resolve, (Number.isFinite(retryAfter) ? retryAfter : 5) * 1000));
-        const data = await fn(accessToken);
-        return { data, newRefreshToken };
-      }
-      throw err;
-    }
+    const data = await fn(accessToken);
+    return { data, newRefreshToken };
   } catch (err) {
     // The refresh SUCCEEDED before fn() failed — a rotated token must still
     // reach the caller or one harmless API error permanently strands the
@@ -229,13 +268,12 @@ export const gmailProvider: GmailProvider = {
       const window = ids.slice(skip, needed);
       // metadata format: headers + snippet + labels, no body — the list
       // surface stays cheap; get-message provides full fidelity (body,
-      // attachment detection).
-      const messages = await Promise.all(
-        window.map((id) =>
-          apiFetch<GmailApiMessage>(accessToken, 'GET', `/messages/${encodeURIComponent(id)}`, {
-            query: { format: 'metadata', metadataHeaders: ['Subject', 'From', 'To'] },
-          }),
-        ),
+      // attachment detection). Hydration is concurrency-bounded so a
+      // top=100 page cannot burst past Gmail's per-user quota.
+      const messages = await mapWithConcurrency(window, FANOUT_CONCURRENCY, (id) =>
+        apiFetch<GmailApiMessage>(accessToken, 'GET', `/messages/${encodeURIComponent(id)}`, {
+          query: { format: 'metadata', metadataHeaders: ['Subject', 'From', 'To'] },
+        }),
       );
       return messages.map(parseGmailMessage);
     });
@@ -284,11 +322,11 @@ export const gmailProvider: GmailProvider = {
   async listFolders(refreshToken) {
     return withToken(refreshToken, async (accessToken) => {
       const list = await apiFetch<{ labels?: LabelResource[] }>(accessToken, 'GET', '/labels');
-      const labels = (list.labels ?? []).slice(0, 100); // labels.list carries no counts
-      const detailed = await Promise.all(
-        labels.map((l) =>
-          apiFetch<LabelResource>(accessToken, 'GET', `/labels/${encodeURIComponent(l.id)}`).catch(() => l),
-        ),
+      // labels.list carries no counts — hydrate each label (bounded
+      // concurrency; a failed count fetch degrades to zeros, never drops
+      // the folder from the listing).
+      const detailed = await mapWithConcurrency(list.labels ?? [], FANOUT_CONCURRENCY, (l) =>
+        apiFetch<LabelResource>(accessToken, 'GET', `/labels/${encodeURIComponent(l.id)}`).catch(() => l),
       );
       return detailed.map((l) => ({
         id: l.id,
@@ -323,7 +361,10 @@ export const gmailProvider: GmailProvider = {
   async updateDraft(refreshToken, draftId, bodyHtml) {
     return withToken(refreshToken, async (accessToken) => {
       // drafts.update replaces the whole message — re-read the draft and
-      // preserve its recipients, subject, and threading headers.
+      // preserve its recipients (To/Cc/Bcc), subject, and threading headers.
+      // KNOWN LIMIT: attachment parts on a draft edited outside this tool are
+      // NOT carried over (preserving them means splicing the original raw
+      // MIME); documented in the README's tradeoffs.
       const existing = await apiFetch<DraftResource>(accessToken, 'GET', `/drafts/${encodeURIComponent(draftId)}`, {
         query: { format: 'full' },
       });
@@ -331,6 +372,7 @@ export const gmailProvider: GmailProvider = {
       const mime = buildMimeMessage({
         to: parseAddressList(headerValue(headers, 'To')),
         cc: parseAddressList(headerValue(headers, 'Cc')),
+        bcc: parseAddressList(headerValue(headers, 'Bcc')),
         subject: headerValue(headers, 'Subject') ?? '',
         bodyHtml,
         inReplyTo: headerValue(headers, 'In-Reply-To'),
@@ -374,7 +416,12 @@ export const gmailProvider: GmailProvider = {
 
   async categorizeMessage(refreshToken, messageId, categories) {
     return withToken(refreshToken, async (accessToken) => {
-      const list = await apiFetch<{ labels?: LabelResource[] }>(accessToken, 'GET', '/labels');
+      const [list, current] = await Promise.all([
+        apiFetch<{ labels?: LabelResource[] }>(accessToken, 'GET', '/labels'),
+        apiFetch<GmailApiMessage>(accessToken, 'GET', `/messages/${encodeURIComponent(messageId)}`, {
+          query: { format: 'minimal' },
+        }),
+      ]);
       const userLabels = (list.labels ?? []).filter((l) => l.type === 'user');
       const byName = new Map(userLabels.map((l) => [l.name.toLowerCase(), l]));
 
@@ -390,9 +437,6 @@ export const gmailProvider: GmailProvider = {
           targetIds.push(created.id);
         }
       }
-      const current = await apiFetch<GmailApiMessage>(accessToken, 'GET', `/messages/${encodeURIComponent(messageId)}`, {
-        query: { format: 'minimal' },
-      });
       const userLabelIds = new Set(userLabels.map((l) => l.id));
       const currentUserIds = (current.labelIds ?? []).filter((l) => userLabelIds.has(l));
       const target = new Set(targetIds);

@@ -11,18 +11,13 @@
  * fully-processed cursor).
  */
 import { withConnection } from './connectionCall.js';
-import type { Db } from './db.js';
+import { isUniqueViolation, type Db } from './db.js';
 import { NotFoundError } from './errors.js';
 import type { EmailEvent, EventForwarder } from './events/forwarder.js';
 import { logError, logInfo } from './logger.js';
 import { normalizeMessage } from './ops/index.js';
 import type { GmailProvider } from './providers/gmail/types.js';
 import { FOLDER_EVENTS, folderForLabels } from './watches.js';
-
-/** Prisma unique-violation check (P2002). */
-function isUniqueViolation(err: unknown): boolean {
-  return (err as { code?: string } | null)?.code === 'P2002';
-}
 
 type ConnectionRow = { id: string; mailboxEmail: string };
 
@@ -96,10 +91,15 @@ export async function processConnectionHistory(
   if (!watch) return; // no watch registered — nothing to process
 
   if (watch.lastHistoryId == null) {
-    // No baseline yet (legacy row) — adopt the notified id; deltas start
-    // from the next notification.
+    // No baseline (a partially-failed re-watch or legacy row) — adopt the
+    // notified id so deltas start from the NEXT notification. history.list
+    // is strictly-after, so the messages behind THIS notification cannot be
+    // recovered; say so loudly instead of losing them silently.
     if (notifiedHistoryId) {
       await db.watch.update({ where: { id: watch.id }, data: { lastHistoryId: notifiedHistoryId } });
+      logError(
+        `connection ${connection.id} had no history cursor — baselined to ${notifiedHistoryId}; the delta behind this notification was not forwarded`,
+      );
     }
     return;
   }

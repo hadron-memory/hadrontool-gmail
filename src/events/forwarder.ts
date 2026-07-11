@@ -18,29 +18,31 @@ export interface EmailEvent {
   message: EmailMessage;
 }
 
-/** Signature of the forwarder — injectable for tests. */
+/** Signature of the forwarder — injectable for tests. A REJECTION means the
+ *  event was not delivered: history processing releases the dedupe row and
+ *  holds the cursor back so the delta is retried. Swallowing failures here
+ *  would silently defeat the at-least-once mechanism. */
 export type EventForwarder = (event: EmailEvent) => Promise<void>;
 
-/** Production forwarder: POST to core with the events bearer token. */
+/** Production forwarder: POST to core with the events bearer token. Unset
+ *  CORE_EVENTS_URL is a deliberate no-consumer deploy → log + drop (success);
+ *  a configured-but-failing ingress THROWS so the caller retries. */
 export const forwardEventToCore: EventForwarder = async (event) => {
   if (!config.coreEventsUrl) {
     logInfo(`event ${event.event} for connection ${event.connectionId} dropped (CORE_EVENTS_URL unset)`);
     return;
   }
-  try {
-    const res = await fetch(config.coreEventsUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(config.coreEventsToken ? { authorization: `Bearer ${config.coreEventsToken}` } : {}),
-      },
-      body: JSON.stringify(event),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) {
-      logError(`core event ingress returned ${res.status} for ${event.event} (connection ${event.connectionId})`);
-    }
-  } catch (err) {
-    logError(`failed to deliver ${event.event} for connection ${event.connectionId} to core`, err);
+  const res = await fetch(config.coreEventsUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(config.coreEventsToken ? { authorization: `Bearer ${config.coreEventsToken}` } : {}),
+    },
+    body: JSON.stringify(event),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    logError(`core event ingress returned ${res.status} for ${event.event} (connection ${event.connectionId})`);
+    throw new Error(`core event ingress returned ${res.status}`);
   }
 };

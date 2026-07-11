@@ -17,14 +17,12 @@
 import { createHash } from 'crypto';
 import { z } from 'zod';
 import { withConnection } from '../connectionCall.js';
-import type { Db } from '../db.js';
+import { isUniqueViolation, type Db } from '../db.js';
 import {
   BodyRequiredError,
-  EmailToolError,
   RecipientsRequiredError,
   ValidationError,
-  mapGmailError,
-  validationFromZod,
+  toEmailToolError,
 } from '../errors.js';
 import { UNREAD_LABEL } from '../providers/gmail/labels.js';
 import type { GmailMessage, GmailProvider } from '../providers/gmail/types.js';
@@ -111,7 +109,15 @@ const saveDraftSchema = connectionIdSchema.extend({
 const updateDraftSchema = connectionIdSchema.extend({ draftId: z.string().min(1), bodyHtml: z.string() });
 const draftRefSchema = connectionIdSchema.extend({ draftId: z.string().min(1) });
 const markReadSchema = messageRefSchema.extend({ isRead: z.boolean().default(true) });
-const flagSchema = messageRefSchema.extend({ flag: z.enum(['flagged', 'none', 'complete']).default('flagged') });
+// The neutral vocabulary includes 'complete', but Gmail's star is binary —
+// the rejection lives IN the schema (not a shadow check in the handler) so
+// the declared contract and the enforced one cannot drift.
+const flagSchema = messageRefSchema.extend({
+  flag: z
+    .enum(['flagged', 'none', 'complete'])
+    .default('flagged')
+    .refine((f) => f !== 'complete', "the 'complete' flag state is not supported by Gmail"),
+});
 const categorizeSchema = messageRefSchema.extend({ categories: z.array(z.string()) });
 
 /** The v1 operation registry, keyed by spec 002 operation name. */
@@ -209,12 +215,7 @@ export const OPERATIONS: Record<string, OperationDef> = {
   }),
 
   'flag-message': defineOp(true, flagSchema, async (db, provider, input) => {
-    // Gmail's star is binary — the neutral 'complete' state has no Gmail
-    // representation and is rejected rather than silently degraded.
-    if (input.flag === 'complete') {
-      throw new ValidationError('flag', "the 'complete' flag state is not supported by Gmail");
-    }
-    const flag = input.flag;
+    const flag = input.flag as 'flagged' | 'none'; // 'complete' rejected by the schema
     await withConnection(db, input.connectionId, { resource: 'message', id: input.messageId }, (token) =>
       provider.flagMessage(token, input.messageId, flag),
     );
@@ -229,6 +230,12 @@ export const OPERATIONS: Record<string, OperationDef> = {
   }),
 };
 
+/** An in-flight reservation older than this is considered orphaned (the
+ *  process died between the INSERT and the response update) and may be
+ *  reclaimed by a retry — otherwise a crash blocks the key until the 7-day
+ *  ledger prune. Well above any real request duration. */
+const STALE_RESERVATION_MS = 5 * 60 * 1000;
+
 /** Recursively key-sort a value so semantically equal inputs hash equal. */
 function canonical(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(canonical);
@@ -242,14 +249,10 @@ function canonical(v: unknown): unknown {
   return v;
 }
 
-/** Stable SHA-256 of an operation input for idempotency-payload matching. */
-function hashInput(input: Record<string, unknown>): string {
+/** Stable SHA-256 of an operation input for idempotency-payload matching.
+ *  Exported for tests that need to seed matching reservation rows. */
+export function hashInput(input: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(canonical(input))).digest('hex');
-}
-
-/** Prisma unique-violation check (P2002) — anything else is a real DB error. */
-function isUniqueViolation(err: unknown): boolean {
-  return (err as { code?: string } | null)?.code === 'P2002';
 }
 
 /**
@@ -259,6 +262,9 @@ function isUniqueViolation(err: unknown): boolean {
  * the provider mutation — it sees the reservation and is told to retry. A
  * completed key replays the stored response; a key reused with a different
  * operation or payload is rejected instead of leaking the stored response.
+ * An in-flight reservation past the staleness cutoff (crashed process) is
+ * reclaimed atomically so a retry can execute instead of waiting for the
+ * ledger prune.
  */
 export async function runOperation(
   db: Db,
@@ -286,6 +292,16 @@ export async function runOperation(
         throw new ValidationError('idempotencyKey', 'key was already used for a different request');
       }
       if (existing.responseJson == null) {
+        // Reclaim an orphaned reservation (process died mid-request): the
+        // conditional deleteMany is atomic, so of two concurrent retries only
+        // one proceeds; the other still sees in-flight.
+        const cutoff = new Date(Date.now() - STALE_RESERVATION_MS);
+        const reclaimed = await db.idempotencyRecord.deleteMany({
+          where: { key: idempotencyKey!, responseJson: null, createdAt: { lt: cutoff } },
+        });
+        if (reclaimed.count === 1) {
+          return runOperation(db, provider, name, input, idempotencyKey);
+        }
         throw new ValidationError('idempotencyKey', 'a request with this key is still in flight — retry shortly');
       }
       return { result: JSON.parse(existing.responseJson), replayed: true };
@@ -300,9 +316,7 @@ export async function runOperation(
     if (useIdempotency) {
       await db.idempotencyRecord.delete({ where: { key: idempotencyKey! } }).catch(() => {});
     }
-    if (err instanceof z.ZodError) throw validationFromZod(err);
-    if (err instanceof EmailToolError) throw err;
-    throw mapGmailError(err);
+    throw toEmailToolError(err);
   }
 
   if (useIdempotency) {

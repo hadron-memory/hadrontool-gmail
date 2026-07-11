@@ -175,6 +175,30 @@ describe('POST /webhooks/gmail', () => {
     expect(advanced.lastHistoryId).toBe('200');
   });
 
+  it('holds the cursor back when delivery to core fails (forwarder rejects)', async () => {
+    const connection = await seedWatchedConnection(['inbox'], '100');
+    const delta = {
+      historyId: '200',
+      messagesAdded: [{ id: 'msg-77', threadId: null, labelIds: ['INBOX'] }],
+    };
+    const provider = fakeProvider({ historyDelta: delta });
+    const failingForward = createApp(db, provider, async () => {
+      throw new Error('core ingress 503');
+    });
+
+    await request(failingForward).post(PUSH_PATH).send(pushBody()).expect(204);
+    await settle();
+
+    expect(await db.processedNotification.count()).toBe(0); // dedupe released
+    const held = await db.watch.findUniqueOrThrow({ where: { connectionId: connection.id } });
+    expect(held.lastHistoryId).toBe('100'); // NOT advanced — the delta retries
+
+    const { app: working, events } = appWithEvents({ historyDelta: delta });
+    await request(working).post(PUSH_PATH).send(pushBody()).expect(204);
+    await settle();
+    expect(events).toHaveLength(1);
+  });
+
   it('treats a message that vanished before processing as handled (cursor advances)', async () => {
     const connection = await seedWatchedConnection(['inbox'], '100');
     const { app, events } = appWithEvents({

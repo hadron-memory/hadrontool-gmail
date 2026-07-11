@@ -23,10 +23,15 @@ describe('mapGmailError', () => {
     expect(mapGmailError({ statusCode: 401 })).toBeInstanceOf(ConnectionUnauthorizedError);
   });
 
-  it('maps a plain 403 to connection_unauthorized (insufficient scopes / revoked)', () => {
-    expect(mapGmailError({ statusCode: 403, reason: 'insufficientPermissions' })).toBeInstanceOf(
-      ConnectionUnauthorizedError,
-    );
+  it('maps auth-class 403 reasons to connection_unauthorized', () => {
+    for (const reason of ['authError', 'insufficientPermissions', 'accountDisabled']) {
+      expect(mapGmailError({ statusCode: 403, reason }), reason).toBeInstanceOf(ConnectionUnauthorizedError);
+    }
+  });
+
+  it('maps non-auth 403s (e.g. Pub/Sub topic permission) to provider_unavailable — never bricking the connection', () => {
+    expect(mapGmailError({ statusCode: 403, reason: 'forbidden' })).toBeInstanceOf(ProviderUnavailableError);
+    expect(mapGmailError({ statusCode: 403 })).toBeInstanceOf(ProviderUnavailableError);
   });
 
   it('maps 403 quota reasons to provider_rate_limited (Google rate limits via 403 too)', () => {
@@ -47,6 +52,13 @@ describe('mapGmailError', () => {
     expect(absent.retryAfterSeconds).toBe(60);
     const malformed = mapGmailError({ statusCode: 429, headers: headersWith('soon') }) as ProviderRateLimitedError;
     expect(malformed.retryAfterSeconds).toBe(60);
+  });
+
+  it('parses the RFC 7231 HTTP-date form of Retry-After', () => {
+    const date = new Date(Date.now() + 90 * 1000).toUTCString();
+    const mapped = mapGmailError({ statusCode: 429, headers: headersWith(date) }) as ProviderRateLimitedError;
+    expect(mapped.retryAfterSeconds).toBeGreaterThan(80);
+    expect(mapped.retryAfterSeconds).toBeLessThanOrEqual(91);
   });
 
   it('maps 404 to not_found with the resource hint', () => {

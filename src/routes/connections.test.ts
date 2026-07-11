@@ -161,6 +161,35 @@ describe('/connections', () => {
     expect(await db.subscribedFolder.count({ where: { connectionId: connection.id } })).toBe(0);
   });
 
+  it('does NOT stop the account-wide watch while a sibling connection for the same mailbox exists', async () => {
+    // users.stop is mailbox-level: disconnecting org A's connection must not
+    // kill org B's push feed (or the new connection minted by a reconnect).
+    const orgA = await db.connection.create({
+      data: { mailboxEmail: 'shared@gmail.example', refreshTokenEnc: encryptToken('rt-a') },
+    });
+    const orgB = await db.connection.create({
+      data: { mailboxEmail: 'shared@gmail.example', refreshTokenEnc: encryptToken('rt-b') },
+    });
+    await db.watch.create({
+      data: { connectionId: orgA.id, expiresAt: new Date(Date.now() + 1000 * 60), lastHistoryId: '1' },
+    });
+    await db.watch.create({
+      data: { connectionId: orgB.id, expiresAt: new Date(Date.now() + 1000 * 60), lastHistoryId: '1' },
+    });
+    const provider = fakeProvider();
+    const app = createApp(db, provider, async () => {});
+
+    await request(app).delete(`/connections/${orgA.id}`).set(AUTH).expect(200);
+
+    expect(provider.calls.some(([m]) => m === 'stopWatch')).toBe(false);
+    expect(await db.watch.count({ where: { connectionId: orgA.id } })).toBe(0);
+    expect(await db.watch.count({ where: { connectionId: orgB.id } })).toBe(1);
+
+    // The LAST connection for the mailbox does stop the watch.
+    await request(app).delete(`/connections/${orgB.id}`).set(AUTH).expect(200);
+    expect(provider.calls.some(([m]) => m === 'stopWatch')).toBe(true);
+  });
+
   it('still disconnects when the provider stop-watch call fails', async () => {
     const connection = await db.connection.create({
       data: { mailboxEmail: 'a@b.c', refreshTokenEnc: encryptToken('rt') },

@@ -129,6 +129,21 @@ export function validationFromZod(err: { issues: { path: PropertyKey[]; message:
   return new ValidationError(issue?.path.map(String).join('.') || 'input', issue?.message ?? 'invalid input');
 }
 
+/** True when a value is a zod error (duck-typed to avoid importing zod here). */
+function isZodError(err: unknown): err is { issues: { path: PropertyKey[]; message: string }[] } {
+  return err instanceof Error && err.name === 'ZodError' && Array.isArray((err as { issues?: unknown }).issues);
+}
+
+/**
+ * Convert any thrown value to a typed EmailToolError — the ONE funnel every
+ * plane (ops execution, HTTP responders) uses, so the mapping cannot drift.
+ */
+export function toEmailToolError(err: unknown): EmailToolError {
+  if (isZodError(err)) return validationFromZod(err);
+  if (err instanceof EmailToolError) return err;
+  return mapGmailError(err);
+}
+
 /**
  * Shape of the error this tool's REST client throws for a failed Gmail /
  * Google API call: HTTP status, the parsed `error.status` / first
@@ -150,14 +165,46 @@ const RATE_LIMIT_REASONS = new Set([
   'quotaExceeded',
 ]);
 
+/** Google 403 reasons that genuinely mean the GRANT is unusable (the user
+ *  must reconnect). Any other 403 — e.g. users.watch failing because the
+ *  Pub/Sub topic lacks the publish grant — is a deployment problem, NOT a
+ *  dead grant, and must never mark the connection ERROR. */
+const AUTH_403_REASONS = new Set([
+  'authError',
+  'insufficientPermissions',
+  'accountDeleted',
+  'accountDisabled',
+  'domainPolicy',
+]);
+
+/**
+ * Parse a Retry-After header value into seconds — the ONE parser both the
+ * inline 429 retry and the typed error mapper use. Handles delta-seconds and
+ * the RFC 7231 HTTP-date form; anything unparseable gets the fallback.
+ */
+export function retryAfterSeconds(headers: { get?: (name: string) => string | null } | undefined, fallback: number): number {
+  const raw = headers?.get?.('Retry-After');
+  if (raw == null) return fallback;
+  const asInt = parseInt(raw, 10);
+  if (Number.isFinite(asInt) && String(asInt) === raw.trim() && asInt > 0) return asInt;
+  const asDate = Date.parse(raw);
+  if (Number.isFinite(asDate)) {
+    const delta = Math.ceil((asDate - Date.now()) / 1000);
+    if (delta > 0) return delta;
+  }
+  return fallback;
+}
+
 /**
  * Map a raw Google API / fetch failure to a typed EmailToolError.
  * Anything already typed passes through; unknown shapes become
  * provider_unavailable (transient by default — never pretend success).
  *
  * Google specifics vs Graph: rate limiting arrives as 429 OR as 403 with a
- * quota reason; a dead grant surfaces as 401 (or the token endpoint's 400
- * invalid_grant, mapped in auth.ts before it gets here).
+ * quota reason; a dead grant surfaces as 401 or an auth-class 403 reason
+ * (or the token endpoint's 400 invalid_grant, mapped in auth.ts before it
+ * gets here). Non-auth 403s (topic permissions, policy) stay transient so
+ * they never brick the connection.
  */
 export function mapGmailError(err: unknown, resourceHint?: { resource: 'message' | 'draft' | 'folder'; id: string }): EmailToolError {
   if (err instanceof EmailToolError) return err;
@@ -167,12 +214,13 @@ export function mapGmailError(err: unknown, resourceHint?: { resource: 'message'
   const reason = apiErr.reason;
 
   if (status === 429 || (status === 403 && reason !== undefined && RATE_LIMIT_REASONS.has(reason))) {
-    const raw = apiErr.headers?.get?.('Retry-After');
-    const parsed = raw != null ? parseInt(raw, 10) : NaN;
-    return new ProviderRateLimitedError(Number.isFinite(parsed) && parsed > 0 ? parsed : 60);
+    return new ProviderRateLimitedError(retryAfterSeconds(apiErr.headers, 60));
   }
-  if (status === 401 || status === 403) {
+  if (status === 401 || (status === 403 && reason !== undefined && AUTH_403_REASONS.has(reason))) {
     return new ConnectionUnauthorizedError();
+  }
+  if (status === 403) {
+    return new ProviderUnavailableError();
   }
   if (status === 404) {
     return new NotFoundError(resourceHint?.resource ?? 'message', resourceHint?.id ?? 'unknown');

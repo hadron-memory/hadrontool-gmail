@@ -125,7 +125,22 @@ export function connectionsRouter(db: Db, provider: GmailProvider): Router {
       if (!connection || connection.deletedAt) throw new ConnectionNotFoundError();
 
       if (connection.watch) {
-        await stopWatchForConnection(db, provider, connection.id);
+        // Gmail's users.stop is ACCOUNT-wide — one watch per mailbox, not
+        // per connection. When any other active connection exists for the
+        // same mailbox (a second org, or the new connection minted by a
+        // reconnect whose old-connection delete races this one), stopping
+        // would kill ITS push feed too — skip the provider call and only
+        // drop this connection's rows.
+        const siblings = await db.connection.count({
+          where: { mailboxEmail: connection.mailboxEmail, deletedAt: null, id: { not: connection.id } },
+        });
+        if (siblings === 0) {
+          await stopWatchForConnection(db, provider, connection.id);
+        } else {
+          logInfo(
+            `skipping users.stop for ${connection.mailboxEmail} — ${siblings} sibling connection(s) still watch this mailbox`,
+          );
+        }
         await db.watch.delete({ where: { id: connection.watch.id } }).catch(() => {});
       }
       await db.subscribedFolder.deleteMany({ where: { connectionId: connection.id } });

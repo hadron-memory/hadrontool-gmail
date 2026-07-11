@@ -14,6 +14,7 @@ import { withConnection } from './connectionCall.js';
 import type { Db } from './db.js';
 import { ValidationError } from './errors.js';
 import { logError, logInfo } from './logger.js';
+import { FOLDER_TO_LABEL } from './providers/gmail/labels.js';
 import type { GmailProvider } from './providers/gmail/types.js';
 
 /**
@@ -34,16 +35,22 @@ export function isSubscribableFolder(folder: string): folder is SubscribableFold
   return folder in FOLDER_EVENTS;
 }
 
+/** Event-folder precedence: SENT beats INBOX (a self-addressed sent message
+ *  carries both — it left this mailbox, so it is `email.sent` here). Keys
+ *  must be FOLDER_EVENTS keys; labels come from the one labels.ts registry. */
+const CLASSIFICATION_ORDER: SubscribableFolder[] = ['sentitems', 'inbox'];
+
 /**
- * Classify a history-delta message by its Gmail labels: SENT beats INBOX
- * (a self-addressed sent message carries both — it left this mailbox, so it
- * is `email.sent` here); drafts are never events; anything else (archived
- * directly, spam, …) is not a subscribed-folder event.
+ * Classify a history-delta message by its Gmail labels, deriving from the
+ * FOLDER_EVENTS keys × the labels.ts registry so adding a folder to
+ * FOLDER_EVENTS really is the complete change. Drafts are never events;
+ * anything unmatched (archived directly, spam, …) is not a folder event.
  */
 export function folderForLabels(labelIds: string[]): SubscribableFolder | null {
-  if (labelIds.includes('DRAFT')) return null;
-  if (labelIds.includes('SENT')) return 'sentitems';
-  if (labelIds.includes('INBOX')) return 'inbox';
+  if (labelIds.includes(FOLDER_TO_LABEL.drafts)) return null;
+  for (const folder of CLASSIFICATION_ORDER) {
+    if (isSubscribableFolder(folder) && labelIds.includes(FOLDER_TO_LABEL[folder])) return folder;
+  }
   return null;
 }
 

@@ -47,14 +47,42 @@ function decodePartData(data: string): string {
 }
 
 /**
+ * Decode RFC 2047 encoded-words (`=?charset?B|Q?...?=`) in a header text.
+ * Display names round-tripped from original headers arrive encoded; leaving
+ * them encoded would re-emit `=?UTF-8?B?...?=` gibberish inside a
+ * quoted-string on the build side (RFC 2047 §5 forbids that).
+ */
+export function decodeEncodedWords(text: string): string {
+  return text.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (_m, _charset: string, enc: string, data: string) => {
+    try {
+      if (enc.toUpperCase() === 'B') return Buffer.from(data, 'base64').toString('utf8');
+      // Q-encoding: underscore is space; =XX is a hex byte.
+      const bytes: number[] = [];
+      for (let i = 0; i < data.length; i++) {
+        const ch = data[i];
+        if (ch === '_') bytes.push(0x20);
+        else if (ch === '=' && i + 2 < data.length + 1) {
+          bytes.push(parseInt(data.slice(i + 1, i + 3), 16));
+          i += 2;
+        } else bytes.push(ch.charCodeAt(0));
+      }
+      return Buffer.from(bytes).toString('utf8');
+    } catch {
+      return _m;
+    }
+  });
+}
+
+/**
  * Parse one mailbox in an address header: `"Name" <a@b>`, `Name <a@b>`, or
- * a bare `a@b`. Returns null when no address is present.
+ * a bare `a@b`. Encoded-word display names are decoded. Returns null when no
+ * address is present.
  */
 export function parseAddress(raw: string): MailAddress | null {
   const angled = raw.match(/^\s*(?:"([^"]*)"|([^<]*?))\s*<([^>\s]+)>\s*$/);
   if (angled) {
     const name = (angled[1] ?? angled[2])?.trim();
-    return { name: name ? name : null, address: angled[3] };
+    return { name: name ? decodeEncodedWords(name) : null, address: angled[3] };
   }
   const bare = raw.trim();
   if (bare.includes('@')) return { name: null, address: bare };
@@ -148,12 +176,27 @@ function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').trim();
 }
 
-/** RFC 2047 encoded-word for non-ASCII header text; ASCII passes through. */
+/** RFC 2047 encoded-word(s) for non-ASCII header text; ASCII passes through.
+ *  Long text is chunked so each encoded-word stays ≤75 chars (RFC 2047 §2),
+ *  chunks joined with folding whitespace. */
 export function encodeHeaderText(text: string): string {
   const clean = sanitizeHeaderValue(text);
   // eslint-disable-next-line no-control-regex
   if (/^[\x20-\x7e]*$/.test(clean)) return clean;
-  return `=?UTF-8?B?${Buffer.from(clean, 'utf8').toString('base64')}?=`;
+  // "=?UTF-8?B?" + base64 + "?=" ≤ 75 → ≤ 63 base64 chars → 45 input bytes;
+  // chunk on UTF-8 byte boundaries by slicing characters greedily.
+  const words: string[] = [];
+  let chunk = '';
+  for (const ch of clean) {
+    if (Buffer.byteLength(chunk + ch, 'utf8') > 45) {
+      words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`);
+      chunk = ch;
+    } else {
+      chunk += ch;
+    }
+  }
+  if (chunk) words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`);
+  return words.join('\r\n ');
 }
 
 /** Format one address for a To/Cc header. */
@@ -169,6 +212,7 @@ export function formatAddress(addr: MailAddress): string {
 export interface MimeInput {
   to: MailAddress[];
   cc?: MailAddress[];
+  bcc?: MailAddress[];
   subject: string;
   bodyHtml: string;
   inReplyTo?: string | null;
@@ -181,21 +225,48 @@ function wrap76(b64: string): string {
 }
 
 /**
+ * Fold a header onto continuation lines at whitespace so no physical line
+ * exceeds ~78 chars (RFC 5322 §2.2.3; hard cap 998). Long References chains
+ * from deep threads are the usual offender. Pre-folded values (encoded-word
+ * chunks already joined with CRLF+space) pass through per segment.
+ */
+function foldHeader(name: string, value: string): string {
+  const out: string[] = [];
+  let line = `${name}: `;
+  const tokens = value.split(/(?<!\r\n) /); // spaces that aren't already folds
+  for (const [i, token] of tokens.entries()) {
+    const candidate = i === 0 ? line + token : `${line} ${token}`;
+    if (i > 0 && candidate.length > 78) {
+      out.push(line);
+      line = ` ${token}`; // continuation line starts with folding whitespace
+    } else {
+      line = candidate;
+    }
+  }
+  out.push(line);
+  return out.join('\r\n');
+}
+
+/**
  * Build an RFC 2822 message: HTML body, base64 content-transfer-encoding
- * (avoids all line-length and bare-CRLF pitfalls), CRLF line endings.
+ * (avoids all line-length and bare-CRLF pitfalls), CRLF line endings,
+ * long headers folded.
  */
 export function buildMimeMessage(input: MimeInput): string {
   const lines: string[] = [];
-  lines.push(`To: ${input.to.map(formatAddress).join(', ')}`);
+  lines.push(foldHeader('To', input.to.map(formatAddress).join(', ')));
   if (input.cc && input.cc.length > 0) {
-    lines.push(`Cc: ${input.cc.map(formatAddress).join(', ')}`);
+    lines.push(foldHeader('Cc', input.cc.map(formatAddress).join(', ')));
   }
-  lines.push(`Subject: ${encodeHeaderText(input.subject)}`);
+  if (input.bcc && input.bcc.length > 0) {
+    lines.push(foldHeader('Bcc', input.bcc.map(formatAddress).join(', ')));
+  }
+  lines.push(foldHeader('Subject', encodeHeaderText(input.subject)));
   if (input.inReplyTo) {
-    lines.push(`In-Reply-To: ${sanitizeHeaderValue(input.inReplyTo)}`);
+    lines.push(foldHeader('In-Reply-To', sanitizeHeaderValue(input.inReplyTo)));
   }
   if (input.references) {
-    lines.push(`References: ${sanitizeHeaderValue(input.references)}`);
+    lines.push(foldHeader('References', sanitizeHeaderValue(input.references)));
   }
   lines.push('MIME-Version: 1.0');
   lines.push('Content-Type: text/html; charset="UTF-8"');

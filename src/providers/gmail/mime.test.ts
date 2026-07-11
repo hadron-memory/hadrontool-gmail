@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildMimeMessage,
+  decodeEncodedWords,
   encodeHeaderText,
   extractBody,
   formatAddress,
@@ -39,6 +40,23 @@ describe('parseAddress / parseAddressList', () => {
 
   it('returns [] for a missing header', () => {
     expect(parseAddressList(null)).toEqual([]);
+  });
+
+  it('decodes RFC 2047 encoded-word display names (B and Q)', () => {
+    const b64 = Buffer.from('Ümit Öz', 'utf8').toString('base64');
+    expect(parseAddress(`=?UTF-8?B?${b64}?= <u@x.y>`)).toEqual({ name: 'Ümit Öz', address: 'u@x.y' });
+    expect(parseAddress('=?UTF-8?Q?J=C3=BCrgen_M?= <j@x.y>')).toEqual({ name: 'Jürgen M', address: 'j@x.y' });
+    expect(decodeEncodedWords('plain text')).toBe('plain text');
+  });
+
+  it('round-trips a non-ASCII display name: parse → build re-encodes, never nests encoded-words in quotes', () => {
+    const b64 = Buffer.from('Grüße GmbH', 'utf8').toString('base64');
+    const parsed = parseAddress(`=?UTF-8?B?${b64}?= <g@x.y>`)!;
+    const rebuilt = formatAddress(parsed);
+    // Encoded-word emitted bare (RFC 2047 §5 forbids it inside quotes)…
+    expect(rebuilt).toMatch(/^=\?UTF-8\?B\?.+\?= <g@x\.y>$/);
+    // …and it decodes back to the original name, not double-encoded gibberish.
+    expect(decodeEncodedWords(rebuilt.split(' <')[0])).toBe('Grüße GmbH');
   });
 });
 
@@ -152,23 +170,51 @@ describe('buildMimeMessage', () => {
     expect(Buffer.from(encoded, 'base64').toString('utf8')).toBe('Grüße aus Köln');
   });
 
-  it('adds Cc / In-Reply-To / References only when present', () => {
+  it('adds Cc / Bcc / In-Reply-To / References only when present', () => {
     const bare = buildMimeMessage({ to, subject: 's', bodyHtml: 'x' });
     expect(bare).not.toContain('Cc:');
+    expect(bare).not.toContain('Bcc:');
     expect(bare).not.toContain('In-Reply-To:');
     expect(bare).not.toContain('References:');
 
     const full = buildMimeMessage({
       to,
       cc: [{ name: null, address: 'cc@b.c' }],
+      bcc: [{ name: null, address: 'bcc@b.c' }],
       subject: 's',
       bodyHtml: 'x',
       inReplyTo: '<orig@id>',
       references: '<root@id> <orig@id>',
     });
     expect(full).toContain('Cc: cc@b.c');
+    expect(full).toContain('Bcc: bcc@b.c');
     expect(full).toContain('In-Reply-To: <orig@id>');
     expect(full).toContain('References: <root@id> <orig@id>');
+  });
+
+  it('folds long headers so no physical line exceeds 998 chars (RFC 5322)', () => {
+    const references = Array.from({ length: 60 }, (_, i) => `<message-id-${i}@some.long.example.host>`).join(' ');
+    const mime = buildMimeMessage({ to, subject: 's', bodyHtml: 'x', references });
+    const head = mime.split('\r\n\r\n')[0];
+    for (const line of head.split('\r\n')) {
+      expect(line.length).toBeLessThanOrEqual(998);
+    }
+    // Folded continuation lines start with whitespace and the value survives.
+    expect(head.replace(/\r\n /g, ' ')).toContain(references);
+  });
+
+  it('chunks long non-ASCII subjects into ≤75-char encoded-words', () => {
+    const subject = 'Grüße '.repeat(30);
+    const mime = buildMimeMessage({ to, subject, bodyHtml: 'x' });
+    const encodedWords = mime.match(/=\?UTF-8\?B\?[A-Za-z0-9+/=]+\?=/g)!;
+    expect(encodedWords.length).toBeGreaterThan(1);
+    for (const word of encodedWords) {
+      expect(word.length).toBeLessThanOrEqual(75);
+    }
+    const decoded = encodedWords
+      .map((w) => Buffer.from(w.slice('=?UTF-8?B?'.length, -2), 'base64').toString('utf8'))
+      .join('');
+    expect(decoded).toBe(subject.trim());
   });
 
   it('folds header-injection attempts out of every header', () => {

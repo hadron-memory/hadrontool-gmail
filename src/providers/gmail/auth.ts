@@ -8,7 +8,7 @@
  * carry `access_type=offline&prompt=consent` or Google returns no refresh
  * token; the connections route surfaces that as a typed error.
  */
-import { ConnectionUnauthorizedError, ProviderNotConfiguredError } from '../../errors.js';
+import { ConnectionUnauthorizedError, ProviderNotConfiguredError, ValidationError } from '../../errors.js';
 import { config } from '../../config.js';
 import type { GoogleProfile, TokenResponse } from './types.js';
 
@@ -33,7 +33,7 @@ export async function exchangeGoogleCode(code: string, redirectUri: string): Pro
     redirect_uri: redirectUri,
     grant_type: 'authorization_code',
   });
-  return postToken(body, 'token exchange');
+  return postToken(body, 'code');
 }
 
 /** Use a refresh token to get a fresh access token. Google normally does NOT
@@ -47,11 +47,11 @@ export async function refreshAccessToken(refreshToken: string): Promise<TokenRes
     refresh_token: refreshToken,
     grant_type: 'refresh_token',
   });
-  return postToken(body, 'token refresh');
+  return postToken(body, 'refresh');
 }
 
-/** POST to the token endpoint with shared error shaping. */
-async function postToken(body: URLSearchParams, what: string): Promise<TokenResponse> {
+/** POST to the token endpoint with shared, grant-aware error shaping. */
+async function postToken(body: URLSearchParams, grant: 'code' | 'refresh'): Promise<TokenResponse> {
   const res = await fetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -60,14 +60,18 @@ async function postToken(body: URLSearchParams, what: string): Promise<TokenResp
   });
   if (!res.ok) {
     const err = await res.text();
-    // A dead grant (revoked consent, expired Testing-status refresh token) is
-    // an HTTP 400 invalid_grant from the token endpoint — that is a
-    // connection_unauthorized, NOT a validation error: the connection must be
-    // marked ERROR and the user told to reconnect.
     if (res.status === 400 && err.includes('invalid_grant')) {
+      // invalid_grant means different things per grant type. On a REFRESH it
+      // is a dead grant (revoked consent, expired Testing-status token) —
+      // connection_unauthorized, so the connection gets marked ERROR. On a
+      // CODE exchange no connection exists yet: the code is expired/replayed,
+      // which is the caller's input problem, not a reconnect situation.
+      if (grant === 'code') {
+        throw new ValidationError('code', 'the authorization code is invalid, expired, or already redeemed');
+      }
       throw new ConnectionUnauthorizedError();
     }
-    const failure = new Error(`Google ${what} failed: ${err}`) as Error & { statusCode: number };
+    const failure = new Error(`Google token ${grant} exchange failed: ${err}`) as Error & { statusCode: number };
     failure.statusCode = res.status;
     throw failure;
   }

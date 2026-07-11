@@ -11,3 +11,9 @@ const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL ?? '' 
 
 export const db = new PrismaClient({ adapter });
 export type Db = PrismaClient;
+
+/** Prisma unique-violation check (P2002) — anything else is a real DB error.
+ *  Shared by the idempotency reservation and the notification dedupe. */
+export function isUniqueViolation(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === 'P2002';
+}

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../app.js';
 import { encryptToken, decryptToken } from '../crypto.js';
 import { db } from '../db.js';
+import { hashInput } from '../ops/index.js';
 import { fakeProvider, resetDb } from '../test/fakes.js';
 
 const AUTH = { Authorization: 'Bearer test-tool-token' };
@@ -211,6 +212,32 @@ describe('POST /ops/:operation', () => {
       .send({ connectionId, draftId: 'd-1', idempotencyKey: 'key-inflight' });
     expect(res.status).toBe(400);
     expect(provider.calls.filter(([m]) => m === 'sendDraft')).toHaveLength(0);
+  });
+
+  it('reclaims a stale orphaned reservation (crashed process) so a retry executes', async () => {
+    const connectionId = await seedConnection();
+    const provider = fakeProvider();
+    const app = createApp(db, provider, async () => {});
+
+    // A reservation from a request whose process died mid-flight, past the
+    // staleness cutoff — the retry (same payload, same hash) must execute,
+    // not wait for the 7-day prune.
+    await db.idempotencyRecord.create({
+      data: {
+        key: 'key-orphan',
+        operation: 'send-draft',
+        requestHash: hashInput({ connectionId, draftId: 'd-1' }),
+        responseJson: null,
+        createdAt: new Date(Date.now() - 10 * 60 * 1000),
+      },
+    });
+    const res = await request(app)
+      .post('/ops/send-draft')
+      .set(AUTH)
+      .send({ connectionId, draftId: 'd-1', idempotencyKey: 'key-orphan' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ sent: true, replayed: false });
+    expect(provider.calls.filter(([m]) => m === 'sendDraft')).toHaveLength(1);
   });
 
   it('releases the reservation when the operation fails so a retry can execute', async () => {
