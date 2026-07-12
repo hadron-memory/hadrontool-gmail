@@ -33,22 +33,38 @@ function pushBody(emailAddress = 'prof@example.edu', historyId: string | number 
   };
 }
 
+// Every push acks immediately and processes fire-and-forget; the webhook
+// route's onProcessing seam hands us each processing promise so settle() can
+// await real completion instead of racing a fixed timer (flaky under load).
+const inFlight: Promise<void>[] = [];
+
 /** Build an app collecting forwarded events over a fake provider. */
 function appWithEvents(options: FakeProviderOptions = {}) {
   const events: EmailEvent[] = [];
   const provider = fakeProvider(options);
-  const app = createApp(db, provider, async (e) => {
-    events.push(e);
-  });
+  const app = createApp(
+    db,
+    provider,
+    async (e) => {
+      events.push(e);
+    },
+    (p) => inFlight.push(p),
+  );
   return { app, events, provider };
 }
 
-/** Await the fire-and-forget notification processing. */
-function settle(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 50));
+/** Await all fire-and-forget processing kicked off so far (draining any that
+ *  are themselves scheduled while awaiting). */
+async function settle(): Promise<void> {
+  while (inFlight.length > 0) {
+    await Promise.all(inFlight.splice(0));
+  }
 }
 
-beforeEach(() => resetDb(db));
+beforeEach(async () => {
+  await settle(); // drain any stragglers from a prior test before resetting
+  await resetDb(db);
+});
 
 describe('POST /webhooks/gmail', () => {
   it('rejects pushes without the verification token (no processing)', async () => {

@@ -2,8 +2,9 @@
  * Event plane, tool → core (same seam as hadrontool-ms-exchange): normalized
  * email events are POSTed to hadron-server's internal ingress over HTTP now,
  * designed so the transport can wrap behind a NATS subject later without
- * touching callers. Unset CORE_EVENTS_URL ⇒ events are logged and dropped —
- * a missing consumer never breaks notification handling.
+ * touching callers. CORE_EVENTS_URL is REQUIRED in production (config.ts fails
+ * loud at boot); only in development does an unset URL degrade to log+drop so
+ * the tool can boot without core.
  */
 import { config } from '../config.js';
 import { logError, logInfo } from '../logger.js';
@@ -24,12 +25,13 @@ export interface EmailEvent {
  *  would silently defeat the at-least-once mechanism. */
 export type EventForwarder = (event: EmailEvent) => Promise<void>;
 
-/** Production forwarder: POST to core with the events bearer token. Unset
- *  CORE_EVENTS_URL is a deliberate no-consumer deploy → log + drop (success);
- *  a configured-but-failing ingress THROWS so the caller retries. */
+/** Production forwarder: POST to core with the events bearer token. In
+ *  production CORE_EVENTS_URL is guaranteed by config.ts; a dev deploy without
+ *  it degrades to log + drop (success). A configured-but-failing ingress
+ *  THROWS so the caller holds the cursor back and retries. */
 export const forwardEventToCore: EventForwarder = async (event) => {
   if (!config.coreEventsUrl) {
-    logInfo(`event ${event.event} for connection ${event.connectionId} dropped (CORE_EVENTS_URL unset)`);
+    logInfo(`event ${event.event} for connection ${event.connectionId} dropped (CORE_EVENTS_URL unset — dev only)`);
     return;
   }
   const res = await fetch(config.coreEventsUrl, {
