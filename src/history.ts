@@ -138,7 +138,10 @@ export async function processConnectionHistory(
   // overlapping passes (two pushes, or a push racing the worker sweep) must
   // not let a slower pass stomp a newer cursor value backward. A regression
   // is self-healing via the dedupe ledger, but re-reads waste provider quota.
-  if (allHandled && delta.historyId !== startHistoryId) {
+  // The `delta.historyId` truthiness check is belt-and-suspenders: listHistory
+  // seeds it from startHistoryId (always non-empty here), but a falsy value
+  // must never be written as the cursor.
+  if (allHandled && delta.historyId && delta.historyId !== startHistoryId) {
     await db.watch.updateMany({
       where: { id: watch.id, lastHistoryId: startHistoryId },
       data: { lastHistoryId: delta.historyId },

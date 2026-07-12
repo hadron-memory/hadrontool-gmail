@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../app.js';
 import { encryptToken } from '../crypto.js';
 import { db } from '../db.js';
-import type { EmailEvent } from '../events/forwarder.js';
+import type { EmailEvent, EventForwarder } from '../events/forwarder.js';
 import { fakeProvider, resetDb, type FakeProviderOptions } from '../test/fakes.js';
 
 const PUSH_PATH = '/webhooks/gmail?token=test-pubsub-token';
@@ -38,16 +38,19 @@ function pushBody(emailAddress = 'prof@example.edu', historyId: string | number 
 // await real completion instead of racing a fixed timer (flaky under load).
 const inFlight: Promise<void>[] = [];
 
-/** Build an app collecting forwarded events over a fake provider. */
-function appWithEvents(options: FakeProviderOptions = {}) {
+/** Build an app collecting forwarded events over a fake provider. Pass
+ *  `forward` to override the collector (e.g. a rejecting forwarder) — it still
+ *  routes through the onProcessing seam so settle() awaits its processing. */
+function appWithEvents(options: FakeProviderOptions = {}, forward?: EventForwarder) {
   const events: EmailEvent[] = [];
   const provider = fakeProvider(options);
   const app = createApp(
     db,
     provider,
-    async (e) => {
-      events.push(e);
-    },
+    forward ??
+      (async (e) => {
+        events.push(e);
+      }),
     (p) => inFlight.push(p),
   );
   return { app, events, provider };
@@ -197,8 +200,7 @@ describe('POST /webhooks/gmail', () => {
       historyId: '200',
       messagesAdded: [{ id: 'msg-77', threadId: null, labelIds: ['INBOX'] }],
     };
-    const provider = fakeProvider({ historyDelta: delta });
-    const failingForward = createApp(db, provider, async () => {
+    const { app: failingForward } = appWithEvents({ historyDelta: delta }, async () => {
       throw new Error('core ingress 503');
     });
 
