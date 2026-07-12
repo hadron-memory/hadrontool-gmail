@@ -5,9 +5,12 @@
  * adapter (the CLI reads the URL from prisma.config.ts instead).
  */
 import { PrismaPg } from '@prisma/adapter-pg';
+import { config } from './config.js';
 import { PrismaClient } from './generated/prisma/client.js';
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL ?? '' });
+// config.databaseUrl is required in production (fails loud at boot); the ''
+// fallback only applies in dev/test where the URL comes from .env / vitest.
+const adapter = new PrismaPg({ connectionString: config.databaseUrl ?? '' });
 
 export const db = new PrismaClient({ adapter });
 export type Db = PrismaClient;

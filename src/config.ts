@@ -34,6 +34,11 @@ function required(name: string): string | undefined {
 export const config = {
   port: Number(env('PORT') ?? 8080),
 
+  /** The tool's OWN Postgres URL (encrypted tokens, watch state, ledgers).
+   *  Required in production — a DB-less boot would pass /healthz while every
+   *  token/watch/idempotency path fails at runtime. */
+  databaseUrl: required('DATABASE_URL'),
+
   /** Bearer token gating /ops/* and /connections*. Required in production. */
   toolToken: required('GMAIL_TOOL_TOKEN'),
 
@@ -58,8 +63,14 @@ export const config = {
    */
   pubsubVerificationToken: required('PUBSUB_VERIFICATION_TOKEN'),
 
-  /** hadron-server's internal event ingress; unset ⇒ events logged + dropped. */
-  coreEventsUrl: env('CORE_EVENTS_URL'),
+  /**
+   * hadron-server's internal event ingress. Required in production: this is
+   * the whole point of the event plane, and an unset URL makes the forwarder
+   * log+drop every event as "success", which advances the history cursor and
+   * loses mail events UNRECOVERABLY (see events/forwarder.ts). In development
+   * an unset URL still degrades to log+drop so the tool boots without core.
+   */
+  coreEventsUrl: required('CORE_EVENTS_URL'),
   coreEventsToken: env('CORE_EVENTS_TOKEN'),
 
   maxBodySize: env('MAX_BODY_SIZE') ?? '2mb',

@@ -24,6 +24,7 @@ import {
   ValidationError,
   toEmailToolError,
 } from '../errors.js';
+import { logError } from '../logger.js';
 import { UNREAD_LABEL } from '../providers/gmail/labels.js';
 import type { GmailMessage, GmailProvider } from '../providers/gmail/types.js';
 
@@ -320,9 +321,20 @@ export async function runOperation(
   }
 
   if (useIdempotency) {
+    // The mutation already SUCCEEDED; persist its response so a retry replays
+    // instead of re-executing. A silent failure here is dangerous: the
+    // reservation stays in-flight and, past the staleness cutoff, a retry
+    // reclaims it and re-runs the mutation (duplicate send/reply). We cannot
+    // throw — that would tell the caller the (completed) op failed and invite
+    // exactly that retry — so surface it loudly instead.
     await db.idempotencyRecord
       .update({ where: { key: idempotencyKey! }, data: { responseJson: JSON.stringify(result) } })
-      .catch(() => {});
+      .catch((err) =>
+        logError(
+          `idempotency completion write failed for key ${idempotencyKey} (${name}) — the mutation succeeded but is not recorded; a retry after the ${STALE_RESERVATION_MS}ms staleness window could re-execute it`,
+          err,
+        ),
+      );
   }
   return { result, replayed: false };
 }

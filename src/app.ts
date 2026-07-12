@@ -25,8 +25,14 @@ import { webhooksRouter } from './routes/webhooks.js';
 /** Package version, surfaced on /info. */
 const VERSION = process.env.npm_package_version ?? '0.1.0';
 
-/** Build the app over injected dependencies. */
-export function createApp(db: Db, provider: GmailProvider, forward: EventForwarder): Express {
+/** Build the app over injected dependencies. `onProcessing` is a test-only
+ *  seam threaded to the webhook route (see webhooksRouter); production omits it. */
+export function createApp(
+  db: Db,
+  provider: GmailProvider,
+  forward: EventForwarder,
+  onProcessing?: (p: Promise<void>) => void,
+): Express {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: config.maxBodySize }));
@@ -56,7 +62,7 @@ export function createApp(db: Db, provider: GmailProvider, forward: EventForward
 
   app.use('/ops', requireToolToken, opsRouter(db, provider));
   app.use('/connections', requireToolToken, connectionsRouter(db, provider));
-  app.use('/webhooks', webhooksRouter(db, provider, forward));
+  app.use('/webhooks', webhooksRouter(db, provider, forward, onProcessing));
 
   // Errors thrown OUTSIDE route try/catch blocks — body-parse failures
   // included — get the service's uniform JSON error shape, never Express's

@@ -44,8 +44,20 @@ function decodeNotification(body: unknown): { emailAddress: string; historyId: s
   }
 }
 
-/** Build the /webhooks router over injected db + provider + forwarder. */
-export function webhooksRouter(db: Db, provider: GmailProvider, forward: EventForwarder): Router {
+/**
+ * Build the /webhooks router over injected db + provider + forwarder.
+ *
+ * `onProcessing` is a test-only seam: the push is acked immediately and the
+ * history processing runs fire-and-forget, so tests need a handle on that
+ * promise to await it deterministically (a fixed sleep is racy under load).
+ * Production passes nothing.
+ */
+export function webhooksRouter(
+  db: Db,
+  provider: GmailProvider,
+  forward: EventForwarder,
+  onProcessing?: (p: Promise<void>) => void,
+): Router {
   const router = Router();
 
   router.post('/gmail', (req, res) => {
@@ -67,9 +79,14 @@ export function webhooksRouter(db: Db, provider: GmailProvider, forward: EventFo
     res.status(204).end();
     if (!notification) return;
 
-    processPushNotification(db, provider, forward, notification.emailAddress, notification.historyId).catch((err) =>
-      logError('push notification processing crashed', err),
-    );
+    const processing = processPushNotification(
+      db,
+      provider,
+      forward,
+      notification.emailAddress,
+      notification.historyId,
+    ).catch((err) => logError('push notification processing crashed', err));
+    onProcessing?.(processing);
   });
 
   return router;
