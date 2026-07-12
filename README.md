@@ -72,6 +72,11 @@ Gmail-specific mappings behind the neutral surface:
   `hasAttachments: false`) — Gmail's list surface is id-only, and hydrating
   full bodies per page is not worth the quota; `get-message` returns full
   fidelity.
+- **`update-draft` preserves recipients (To/Cc/Bcc), subject, and threading
+  headers, but NOT attachments** — `drafts.update` replaces the whole
+  message, and re-splicing attachment parts from the original raw MIME is
+  out of v1 scope. A draft that gained attachments outside this tool loses
+  them when the tool updates its body.
 - **Replies build real MIME**: Gmail has no one-call reply, so the tool
   constructs RFC 2822 (`Re:` subject, `In-Reply-To`/`References`, reply-all
   recipient computation excluding the connected mailbox) and sends on the
